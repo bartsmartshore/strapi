@@ -19,6 +19,8 @@ import { contentTypes } from '@strapi/utils';
 type DocumentVersion = { documentId: string; locale: string };
 type Knex = Parameters<Migration['up']>[0];
 
+const BATCH_SIZE = 1000;
+
 /**
  * Check if the model has draft and publish enabled.
  */
@@ -112,30 +114,30 @@ async function copyRelationsToDrafts({ db, trx, uid }: { db: Database; trx: Knex
 
   // Get all published entries for this content type
   const publishedEntries = (await trx(meta.tableName)
-    .select(['id', 'documentId', 'locale'])
-    .whereNotNull('published_at')) as Array<{ id: number; documentId: string; locale: string }>;
+    .select(['id', 'document_id', 'locale'])
+    .whereNotNull('published_at')) as Array<{ id: number; document_id: string; locale: string }>;
 
   // Get all draft entries for this content type
   const draftEntries = (await trx(meta.tableName)
-    .select(['id', 'documentId', 'locale'])
-    .whereNull('published_at')) as Array<{ id: number; documentId: string; locale: string }>;
+    .select(['id', 'document_id', 'locale'])
+    .whereNull('published_at')) as Array<{ id: number; document_id: string; locale: string }>;
 
   if (publishedEntries.length === 0 || draftEntries.length === 0) {
     return;
   }
 
-  // Create mapping from documentId to draft entry ID (only for drafts created by migration)
+  // Create mapping from document_id to draft entry ID (only for drafts created by migration)
   const draftByDocumentId = new Map();
   for (const draft of draftEntries) {
-    if (draft.documentId) {
-      draftByDocumentId.set(draft.documentId, draft);
+    if (draft.document_id) {
+      draftByDocumentId.set(draft.document_id, draft);
     }
   }
 
   // Create mapping from published entry ID to draft entry ID
   const publishedToDraftMap = new Map();
   for (const published of publishedEntries) {
-    const draft = draftByDocumentId.get(published.documentId);
+    const draft = draftByDocumentId.get(published.document_id);
     if (draft) {
       publishedToDraftMap.set(published.id, draft.id);
     }
@@ -150,7 +152,6 @@ async function copyRelationsToDrafts({ db, trx, uid }: { db: Database; trx: Knex
     trx,
     uid,
     publishedToDraftMap,
-    publishedEntries,
   });
 
   // Copy relations from other content types that target this content type
@@ -158,7 +159,6 @@ async function copyRelationsToDrafts({ db, trx, uid }: { db: Database; trx: Knex
     trx,
     uid,
     publishedToDraftMap,
-    publishedEntries,
   });
 }
 
@@ -173,7 +173,6 @@ async function copyRelationsForContentType({
   trx: Knex;
   uid: string;
   publishedToDraftMap: Map<number, number>;
-  publishedEntries: Array<{ id: number; documentId: string; locale: string }>;
 }) {
   const meta = strapi.db.metadata.get(uid);
   if (!meta) return;
@@ -193,33 +192,41 @@ async function copyRelationsForContentType({
     const { name: sourceColumnName } = joinTable.joinColumn;
     const { name: targetColumnName } = joinTable.inverseJoinColumn;
 
-    // Get all relations where the source is a published entry
-    const relations = await trx(joinTable.name).select('*').whereIn(sourceColumnName, publishedIds);
+    // Process relations in batches
+    for (let i = 0; i < publishedIds.length; i += BATCH_SIZE) {
+      const batchIds = publishedIds.slice(i, i + BATCH_SIZE);
 
-    if (relations.length === 0) {
-      continue;
-    }
+      // Get all relations where the source is a published entry
+      const relations = await trx(joinTable.name).select('*').whereIn(sourceColumnName, batchIds);
 
-    // Create new relations pointing to draft entries
-    const newRelations = relations
-      .map((relation) => {
-        const newSourceId = publishedToDraftMap.get(relation[sourceColumnName]);
-        const newTargetId = publishedToDraftMap.get(relation[targetColumnName]);
+      if (relations.length === 0) {
+        continue;
+      }
 
-        if (!newSourceId || !newTargetId) {
-          return null;
-        }
+      // Create new relations pointing to draft entries
+      const newRelations = relations
+        .map((relation) => {
+          const newSourceId = publishedToDraftMap.get(relation[sourceColumnName]);
+          const newTargetId = publishedToDraftMap.get(relation[targetColumnName]);
 
-        return {
-          ...relation,
-          [sourceColumnName]: newSourceId,
-          [targetColumnName]: newTargetId,
-        };
-      })
-      .filter(Boolean);
+          if (!newSourceId || !newTargetId) {
+            return null;
+          }
 
-    if (newRelations.length > 0) {
-      await trx.batchInsert(joinTable.name, newRelations, 1000);
+          // Use all fields but ID (will conflict)
+          const { id, ...remainingFields } = relation;
+
+          return {
+            ...remainingFields,
+            [sourceColumnName]: newSourceId,
+            [targetColumnName]: newTargetId,
+          };
+        })
+        .filter(Boolean);
+
+      if (newRelations.length > 0) {
+        await trx(joinTable.name).insert(newRelations);
+      }
     }
   }
 }
@@ -235,9 +242,8 @@ async function copyRelationsFromOtherContentTypes({
   trx: Knex;
   uid: string;
   publishedToDraftMap: Map<number, number>;
-  publishedEntries: Array<{ id: number; documentId: string; locale: string }>;
 }) {
-  const targetIds = Array.from(publishedToDraftMap.keys());
+  const publishedIds = Array.from(publishedToDraftMap.keys());
 
   // Iterate through all content types and components to find relations targeting our content type
   const contentTypes = Object.values(strapi.contentTypes) as any[];
@@ -259,31 +265,39 @@ async function copyRelationsFromOtherContentTypes({
 
       const { name: targetColumnName } = joinTable.inverseJoinColumn;
 
-      // Get all relations where the target is a published entry of our content type
-      const relations = await trx(joinTable.name).select('*').whereIn(targetColumnName, targetIds);
+      // Process relations in batches
+      for (let i = 0; i < publishedIds.length; i += BATCH_SIZE) {
+        const batchIds = publishedIds.slice(i, i + BATCH_SIZE);
 
-      if (relations.length === 0) {
-        continue;
-      }
+        // Get all relations where the target is a published entry of our content type
+        const relations = await trx(joinTable.name).select('*').whereIn(targetColumnName, batchIds);
 
-      // Create new relations pointing to draft entries
-      const newRelations = relations
-        .map((relation) => {
-          const newTargetId = publishedToDraftMap.get(relation[targetColumnName]);
+        if (relations.length === 0) {
+          continue;
+        }
 
-          if (!newTargetId) {
-            return null;
-          }
+        // Create new relations pointing to draft entries
+        const newRelations = relations
+          .map((relation) => {
+            const newTargetId = publishedToDraftMap.get(relation[targetColumnName]);
 
-          return {
-            ...relation,
-            [targetColumnName]: newTargetId,
-          };
-        })
-        .filter(Boolean);
+            if (!newTargetId) {
+              return null;
+            }
 
-      if (newRelations.length > 0) {
-        await trx.batchInsert(joinTable.name, newRelations, 1000);
+            // Use all fields but ID (will conflict)
+            const { id, ...remainingFields } = relation;
+
+            return {
+              ...remainingFields,
+              [targetColumnName]: newTargetId,
+            };
+          })
+          .filter(Boolean);
+
+        if (newRelations.length > 0) {
+          await trx(joinTable.name).insert(newRelations);
+        }
       }
     }
   }
@@ -328,7 +342,7 @@ export async function* getBatchToDiscard({
   db,
   trx,
   uid,
-  defaultBatchSize = 1000,
+  defaultBatchSize = BATCH_SIZE,
 }: {
   db: Database;
   trx: Knex;
