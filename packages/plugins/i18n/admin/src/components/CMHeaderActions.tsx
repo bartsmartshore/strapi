@@ -32,7 +32,7 @@ import {
   Box,
   Link,
 } from '@strapi/design-system';
-import { WarningCircle, ListPlus, Trash, Earth, Cross, Plus, Sparkle } from '@strapi/icons';
+import { WarningCircle, ListPlus, Trash, Earth, Cross, Plus, Sparkle, Loader } from '@strapi/icons';
 import { useIntl } from 'react-intl';
 import { NavLink, useNavigate } from 'react-router-dom';
 import { styled } from 'styled-components';
@@ -161,20 +161,76 @@ const LocalePickerAction = ({
   });
   const { data: settings } = useGetSettingsQuery();
   const isAiAvailable = useAIAvailability();
+  const setValues = useForm('LocalePickerAction', (state) => state.setValues);
 
   const handleSelect = React.useCallback(
     (value: string) => {
-      setQuery({
-        plugins: {
-          ...query.plugins,
-          i18n: {
-            locale: value,
+      setQuery(
+        {
+          plugins: {
+            ...query.plugins,
+            i18n: {
+              locale: value,
+            },
           },
         },
-      });
+        'push',
+        true
+      );
     },
     [query.plugins, setQuery]
   );
+
+  const nonTranslatedFields = React.useMemo(() => {
+    if (!schema?.attributes) return [];
+    return Object.keys(schema.attributes).filter((field) => {
+      const attribute = schema.attributes[field] as Record<string, unknown>;
+      return (attribute?.pluginOptions as any)?.i18n?.localized === false;
+    });
+  }, [schema?.attributes]);
+
+  const sourceLocaleData = React.useMemo(() => {
+    if (!Array.isArray(locales) || !meta?.availableLocales) return null;
+
+    const defaultLocale = locales.find((locale: Locale) => locale.isDefault);
+    const existingLocales = meta.availableLocales.map((loc) => loc.locale);
+
+    const sourceLocaleCode =
+      defaultLocale &&
+      existingLocales.includes(defaultLocale.code) &&
+      defaultLocale.code !== currentDesiredLocale
+        ? defaultLocale.code
+        : existingLocales.find((locale) => locale !== currentDesiredLocale);
+
+    if (!sourceLocaleCode) return null;
+
+    // Find the document data from availableLocales (now includes non-translatable fields)
+    const sourceLocaleDoc = meta.availableLocales.find((loc) => loc.locale === sourceLocaleCode);
+
+    return sourceLocaleDoc
+      ? { locale: sourceLocaleCode, data: sourceLocaleDoc as Record<string, unknown> }
+      : null;
+  }, [locales, meta?.availableLocales, currentDesiredLocale]);
+
+  /**
+   * Prefilling form with non-translatable fields from already existing locale
+   */
+  React.useEffect(() => {
+    // Only run when creating a new locale (no document ID yet) and when we have non-translatable fields
+    if (!document?.id && nonTranslatedFields.length > 0 && sourceLocaleData?.data) {
+      const dataToSet = nonTranslatedFields.reduce(
+        (acc: Record<string, unknown>, field: string) => {
+          acc[field] = sourceLocaleData.data[field];
+          return acc;
+        },
+        {}
+      );
+
+      if (Object.keys(dataToSet).length > 0) {
+        setValues(dataToSet);
+      }
+    }
+  }, [document?.id, nonTranslatedFields, sourceLocaleData?.data, setValues]);
 
   React.useEffect(() => {
     if (!Array.isArray(locales) || !hasI18n) {
@@ -332,7 +388,8 @@ const AITranslationStatusIcon = styled(Status)<{ $isAISettingEnabled: boolean }>
   gap: ${({ theme }) => theme.spaces[1]};
   justify-content: center;
   align-items: center;
-  height: 100%;
+  height: 3.2rem;
+  width: 3.2rem;
 
   // Disabled state
   ${({ $isAISettingEnabled, theme }) =>
@@ -348,6 +405,19 @@ const AITranslationStatusIcon = styled(Status)<{ $isAISettingEnabled: boolean }>
         fill: ${theme.colors.neutral300};
       `}
   }
+`;
+
+const SpinningLoader = styled(Loader)`
+  @keyframes spin {
+    from {
+      transform: rotate(0deg);
+    }
+    to {
+      transform: rotate(360deg);
+    }
+  }
+
+  animation: spin 2s linear infinite;
 `;
 
 const AITranslationStatusAction = ({ documentId, model, collectionType }: HeaderActionProps) => {
@@ -388,8 +458,9 @@ const AITranslationStatusAction = ({ documentId, model, collectionType }: Header
   return {
     _status: {
       message: (
-        <Box
+        <Flex
           height="100%"
+          alignItems="center"
           aria-label={formatMessage({
             id: getTranslation('CMEditViewAITranslation.status-aria-label'),
             defaultMessage: 'AI Translation Status',
@@ -400,9 +471,9 @@ const AITranslationStatusAction = ({ documentId, model, collectionType }: Header
             variant={statusVariant}
             size="S"
           >
-            <Sparkle />
+            {status === 'processing' ? <SpinningLoader /> : <Sparkle />}
           </AITranslationStatusIcon>
-        </Box>
+        </Flex>
       ),
       tooltip: (
         <Flex direction="column" padding={4} alignItems="flex-start" width="25rem">
@@ -697,6 +768,7 @@ const BulkLocaleAction: DocumentActionComponent = ({
   model,
   collectionType,
   action,
+  meta,
 }: ExtendedDocumentActionProps) => {
   const locale = document?.locale ?? null;
   const [{ query }] = useQueryParams<{ status: 'draft' | 'published' }>();
@@ -764,38 +836,72 @@ const BulkLocaleAction: DocumentActionComponent = ({
       return [[], {}];
     }
 
-    const localizations = document.localizations ?? [];
+    const metaLocalizations = (meta?.availableLocales ?? []).map((locale) => ({
+      locale: locale.locale,
+      status: (locale.status ?? 'draft') as LocaleStatus['status'],
+    }));
+
+    const documentLocalizations = (
+      (document.localizations ?? []) as Array<{
+        locale?: string | null;
+        status?: Modules.Documents.Params.PublicationStatus.Kind | 'modified' | null;
+      }>
+    ).map((doc) => ({
+      locale: doc.locale ?? undefined,
+      status: (doc.status ?? 'draft') as LocaleStatus['status'],
+    }));
+
+    const localesMap = new Map<string, LocaleStatus>();
+
+    metaLocalizations.forEach(({ locale, status }) => {
+      if (locale) {
+        localesMap.set(locale, { locale, status });
+      }
+    });
+
+    documentLocalizations.forEach(({ locale, status }) => {
+      if (locale) {
+        localesMap.set(locale, { locale, status });
+      }
+    });
 
     // Build the rows for the bulk locale publish modal by combining the current
     // document with all the available locales from the document meta
-    const locales: LocaleStatus[] = localizations.map((doc: any) => {
-      const { locale, status } = doc;
-      return { locale, status };
-    });
+    const locales: LocaleStatus[] = [];
 
-    // Add the current document locale
-    locales.unshift({
-      locale: document.locale,
-      status: document.status,
-    });
+    if (document?.locale) {
+      locales.push({
+        locale: document.locale,
+        status: (document.status ?? 'draft') as LocaleStatus['status'],
+      });
+    }
 
-    // Build the validation errors for each locale.
-    const allDocuments = [document, ...localizations];
-    const errors = allDocuments.reduce<FormErrors>((errs, document) => {
-      if (!document) {
-        return errs;
-      }
+    locales.push(
+      ...Array.from(localesMap.entries())
+        .filter(([locale]) => locale !== document?.locale)
+        .map(([, value]) => value)
+    );
 
-      // Validate each locale entry via the useDocument validate function and store any errors in a dictionary
+    if (locales.length === 0 && document?.locale) {
+      locales.push({
+        locale: document.locale,
+        status: (document.status ?? 'draft') as LocaleStatus['status'],
+      });
+    }
+
+    // Validate the current document locale only. Other locales have minimal
+    // data populated for performance reasons and will be validated server-side
+    // during the actual bulk publish operation.
+    const errors: FormErrors = {};
+    if (document.locale) {
       const validation = validate(document as Modules.Documents.AnyDocument);
       if (validation !== null) {
-        errs[document.locale] = validation;
+        errors[document.locale] = validation;
       }
-      return errs;
-    }, {});
+    }
 
     return [locales, errors];
-  }, [document, validate]);
+  }, [document, meta?.availableLocales, validate]);
 
   const isBulkPublish = action === 'bulk-publish';
   const localesForAction = selectedRows.reduce((acc: string[], selectedRow: LocaleStatus) => {
